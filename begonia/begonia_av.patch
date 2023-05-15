@@ -1,0 +1,930 @@
+From 23c7b8ce45363c71462eba701f3ced6bc869129a Mon Sep 17 00:00:00 2001
+From: Erfan Abdi <erfangplus@gmail.com>
+Date: Fri, 23 Jul 2021 17:31:22 +0430
+Subject: [PATCH 1/4] [SQUASH] audiopolicy: Add MTK FM Radio support
+
+* For mtk fm radio we need to adjust device volume/routing on audio frameworks.
+* Fixed some audio channels for S.
+* DarkJoker360: Update for T.
+
+Co-authored-by: nift4 <nift4@protonmail.com>
+Signed-off-by: 7Soldier <reg.fm4@gmail.com>
+Change-Id: Ie205ede046199fde655d2bfd24f88c8b196e48e9
+Signed-off-by: DarkJoker360 <simoespo159@gmail.com>
+Signed-off-by: SHADOW <ayush12345.as@gmail.com>
+---
+ media/libaudioclient/AudioSystem.cpp          |  15 +
+ .../android/media/IAudioPolicyService.aidl    |   2 +
+ services/audiopolicy/AudioPolicyInterface.h   |   2 +
+ .../managerdefault/AudioPolicyManager.cpp     | 262 ++++++++++++++++++
+ .../managerdefault/AudioPolicyManager.h       |  19 +-
+ .../service/AudioPolicyInterfaceImpl.cpp      |   9 +
+ .../service/AudioPolicyService.cpp            |  17 ++
+ .../audiopolicy/service/AudioPolicyService.h  |   2 +
+ 8 files changed, 319 insertions(+), 9 deletions(-)
+
+diff --git a/media/libaudioclient/AudioSystem.cpp b/media/libaudioclient/AudioSystem.cpp
+index 388363a6ad..539c676a64 100644
+--- a/media/libaudioclient/AudioSystem.cpp
++++ b/media/libaudioclient/AudioSystem.cpp
+@@ -34,6 +34,7 @@
+ 
+ #include <system/audio.h>
+ #include <android/media/GetInputForAttrResponse.h>
++#include <media/AudioParameter.h>
+ 
+ #define VALUE_OR_RETURN_BINDER_STATUS(x) \
+     ({ auto _tmp = (x); \
+@@ -97,6 +98,9 @@ void AudioSystem::setAudioFlingerBinder(const sp<IBinder>& audioFlinger) {
+     gAudioFlingerBinder = audioFlinger;
+ }
+ 
++static const char* keySetFmPreStop = "AudioFmPreStop";
++static String8 keyFmPreStop =String8(keySetFmPreStop);
++
+ // establish binder interface to AudioFlinger service
+ const sp<IAudioFlinger> AudioSystem::get_audio_flinger() {
+     sp<IAudioFlinger> af;
+@@ -251,6 +255,17 @@ status_t AudioSystem::setMode(audio_mode_t mode) {
+ }
+ 
+ status_t AudioSystem::setParameters(audio_io_handle_t ioHandle, const String8& keyValuePairs) {
++    ALOGD("+setParameters(): %s ", keyValuePairs.string());
++    int value = 0;
++    String8 value_str;
++    AudioParameter param = AudioParameter(keyValuePairs);
++    if (param.getInt(keyFmPreStop, value) == NO_ERROR) {
++        const sp<IAudioPolicyService>& aps = AudioSystem::get_audio_policy_service();
++        if (aps != 0) {
++            aps->setPolicyManagerParameters (3 /* POLICY_SET_FM_PRESTOP */, value);
++        }
++    }
++
+     const sp<IAudioFlinger>& af = AudioSystem::get_audio_flinger();
+     if (af == 0) return PERMISSION_DENIED;
+     return af->setParameters(ioHandle, keyValuePairs);
+diff --git a/media/libaudioclient/aidl/android/media/IAudioPolicyService.aidl b/media/libaudioclient/aidl/android/media/IAudioPolicyService.aidl
+index 8ac89a847e..a8f8f4d89f 100644
+--- a/media/libaudioclient/aidl/android/media/IAudioPolicyService.aidl
++++ b/media/libaudioclient/aidl/android/media/IAudioPolicyService.aidl
+@@ -201,6 +201,8 @@ interface IAudioPolicyService {
+     boolean isDirectOutputSupported(in AudioConfigBase config,
+                                     in AudioAttributesInternal attributes);
+ 
++    void setPolicyManagerParameters(int key, int value);
++
+     /**
+      * List available audio ports and their attributes. Returns the generation.
+      *
+diff --git a/services/audiopolicy/AudioPolicyInterface.h b/services/audiopolicy/AudioPolicyInterface.h
+index 496591a77c..46a8aa2d2b 100644
+--- a/services/audiopolicy/AudioPolicyInterface.h
++++ b/services/audiopolicy/AudioPolicyInterface.h
+@@ -283,6 +283,8 @@ public:
+     virtual status_t setMasterMono(bool mono) = 0;
+     virtual status_t getMasterMono(bool *mono) = 0;
+ 
++    virtual status_t setPolicyManagerParameters(int key, int value) = 0;
++
+     virtual float    getStreamVolumeDB(
+                 audio_stream_type_t stream, int index, audio_devices_t device) = 0;
+ 
+diff --git a/services/audiopolicy/managerdefault/AudioPolicyManager.cpp b/services/audiopolicy/managerdefault/AudioPolicyManager.cpp
+index 4573382a06..1da9535930 100644
+--- a/services/audiopolicy/managerdefault/AudioPolicyManager.cpp
++++ b/services/audiopolicy/managerdefault/AudioPolicyManager.cpp
+@@ -51,6 +51,7 @@
+ 
+ #include "AudioPolicyManager.h"
+ #include "TypeConverter.h"
++#include <media/AidlConversion.h>
+ 
+ namespace android {
+ 
+@@ -329,6 +330,9 @@ status_t AudioPolicyManager::setDeviceConnectionStateInt(const sp<DeviceDescript
+                         && (!device_distinguishes_on_address(device->type())
+                                 // always force when disconnecting (a non-duplicated device)
+                                 || (state == AUDIO_POLICY_DEVICE_STATE_UNAVAILABLE));
++                if (desc == mPrimaryOutput && force)
++                    newDevices = desc->supportedDevices().filter(newDevices);
++
+                 setOutputDevices(desc, newDevices, force, 0);
+             }
+             if (!desc->isDuplicated() && desc->mProfile->hasDynamicAudioProfile() &&
+@@ -5583,6 +5587,9 @@ AudioPolicyManager::AudioPolicyManager(AudioPolicyClientInterface *clientInterfa
+     mMasterMono(false),
+     mMusicEffectOutput(AUDIO_IO_HANDLE_NONE)
+ {
++    mFMDirectAudioPatchEnable = false;
++    mSkipFMVolControl = false;
++    mFmPortId = 0;
+ }
+ 
+ AudioPolicyManager::AudioPolicyManager(AudioPolicyClientInterface *clientInterface)
+@@ -6418,9 +6425,19 @@ void AudioPolicyManager::checkOutputForAttributes(const audio_attributes_t &attr
+             if (invalidate) {
+                 invalidatedOutputs.push_back(desc);
+                 if (desc->isStrategyActive(psId)) {
++                    bool FMcaseBetweenSPKHP = false;
++                    oldDevices.remove(oldDevices.getDevicesFromTypes({AUDIO_DEVICE_OUT_SPEAKER, AUDIO_DEVICE_OUT_WIRED_HEADSET, AUDIO_DEVICE_OUT_WIRED_HEADPHONE}));
++                    newDevices.remove(newDevices.getDevicesFromTypes({AUDIO_DEVICE_OUT_SPEAKER, AUDIO_DEVICE_OUT_WIRED_HEADSET, AUDIO_DEVICE_OUT_WIRED_HEADPHONE}));
++                    if (followsSameRouting(attr, attributes_initializer(AUDIO_USAGE_MEDIA)) && isFMActive()) {
++                        if (oldDevices.isEmpty() && newDevices.isEmpty()) {
++                            FMcaseBetweenSPKHP = true;
++                        }
++                    }
++                    mSkipFMVolControl = FMcaseBetweenSPKHP;
+                     setStrategyMute(psId, true, desc);
+                     setStrategyMute(psId, false, desc, maxLatency * LATENCY_MUTE_FACTOR,
+                                     newDevices.types());
++                    mSkipFMVolControl = false;
+                 }
+             }
+             sp<SourceClientDescriptor> source = getSourceForAttributesOnOutput(srcOut, attr);
+@@ -6435,6 +6452,21 @@ void AudioPolicyManager::checkOutputForAttributes(const audio_attributes_t &attr
+               std::to_string(dstOutputs[0]).c_str());
+ 
+         // Move effects associated to this stream from previous output to new output
++        if (followsSameRouting(attr, attributes_initializer(AUDIO_USAGE_MEDIA))) {
++            DeviceVector oriOldDevices = oldDevices;
++            DeviceVector oriNewDevices = newDevices;
++            oldDevices.remove(oldDevices.getDevicesFromTypes({AUDIO_DEVICE_OUT_SPEAKER, AUDIO_DEVICE_OUT_WIRED_HEADSET, AUDIO_DEVICE_OUT_WIRED_HEADPHONE}));
++            newDevices.remove(newDevices.getDevicesFromTypes({AUDIO_DEVICE_OUT_SPEAKER, AUDIO_DEVICE_OUT_WIRED_HEADSET, AUDIO_DEVICE_OUT_WIRED_HEADPHONE}));
++            // when playback FM, route to Headset from BT. there is a missing sound of track from BT track Headset.
++            // And then it will mute and the unmute when entering direct mode
++            // If input device is disconnected first, FM active information will disappear, so remove FMActive
++            if (!oldDevices.isEmpty() && newDevices.isEmpty()) {
++                ALOGV("FM mute in-direct primary first, oldDevices %s -> newDevices %s", dumpDeviceTypes(oriOldDevices.types()).c_str(), dumpDeviceTypes(oriNewDevices.types()).c_str());
++                product_strategy_t strategy = mEngine->getProductStrategyForAttributes(attr);
++                setStrategyMute(strategy, true, mPrimaryOutput);
++                setStrategyMute(strategy, false, mPrimaryOutput, MUTE_TIME_MS, newDevices.types());
++            }
++        }
+         if (followsSameRouting(attr, attributes_initializer(AUDIO_USAGE_MEDIA))) {
+             selectOutputForMusicEffects();
+         }
+@@ -6926,6 +6958,14 @@ uint32_t AudioPolicyManager::checkDeviceMuteStrategies(const sp<AudioOutputDescr
+         for (const auto &activeVs : outputDesc->getActiveVolumeSources()) {
+             // make sure that we do not start the temporary mute period too early in case of
+             // delayed device change
++            uint32_t muteDurationMs = outputDesc->latency() * 4;
++            uint32_t extendDurationMs = MUTE_TIME_MS / 2;
++            if (activeVs == toVolumeSource(AUDIO_STREAM_MUSIC)
++                && isFMActive() && muteDurationMs < extendDurationMs) {
++                tempMuteDurationMs = extendDurationMs;
++            } else {
++                tempMuteDurationMs = muteDurationMs;
++            }
+             setVolumeSourceMute(activeVs, true, outputDesc, delayMs);
+             setVolumeSourceMute(activeVs, false, outputDesc, delayMs + tempMuteDurationMs,
+                                 devices.types());
+@@ -6936,6 +6976,13 @@ uint32_t AudioPolicyManager::checkDeviceMuteStrategies(const sp<AudioOutputDescr
+     if (muteWaitMs > delayMs) {
+         muteWaitMs -= delayMs;
+         usleep(muteWaitMs * 1000);
++        if (outputDesc == mPrimaryOutput && isFMDirectActive()) {
++#define WAIT_HW_GAIN_MUTE_TIME (430)
++            if (muteWaitMs < WAIT_HW_GAIN_MUTE_TIME) {
++                usleep((WAIT_HW_GAIN_MUTE_TIME - muteWaitMs) * 1000);
++                muteWaitMs = WAIT_HW_GAIN_MUTE_TIME;
++            }
++        }
+         return muteWaitMs;
+     }
+     return 0;
+@@ -6964,6 +7011,13 @@ uint32_t AudioPolicyManager::setOutputDevices(const sp<SwAudioOutputDescriptor>&
+     DeviceVector prevDevices = outputDesc->devices();
+     DeviceVector availPrevDevices = mAvailableOutputDevices.filter(prevDevices);
+ 
++    if (!devices.isEmpty() && (filteredDevices.isEmpty())) {
++        if (force && outputDesc == mPrimaryOutput && isFMActive()) {
++            nextAudioPortGeneration();
++            mpClientInterface->onAudioPatchListUpdate();
++        }
++    }
++
+     ALOGV("setOutputDevices() prevDevice %s", prevDevices.toString().c_str());
+ 
+     if (!filteredDevices.isEmpty()) {
+@@ -7363,6 +7417,49 @@ status_t AudioPolicyManager::checkAndSetVolume(IVolumeCurves &curves,
+     outputDesc->setVolume(
+             volumeDb, muted, volumeSource, curves.getStreamTypes(), deviceTypes, delayMs, force);
+ 
++    if (!mSkipFMVolControl && volumeSource == toVolumeSource(AUDIO_STREAM_MUSIC)
++            && outputDesc == mPrimaryOutput && (deviceTypes.count(AUDIO_DEVICE_OUT_WIRED_HEADSET) + deviceTypes.count(AUDIO_DEVICE_OUT_WIRED_HEADPHONE) + deviceTypes.count(AUDIO_DEVICE_OUT_SPEAKER) > 0)) {
++        for (ssize_t i = 0; i < (ssize_t)mAudioPatches.size(); i++) {
++            ALOGV("%s size %zu/%zu", __FUNCTION__, i, mAudioPatches.size());
++            sp<AudioPatch> patchDesc = mAudioPatches.valueAt(i);
++            if (isFMDirectMode(patchDesc)) {
++                ALOGV("%s, Do modify audiopatch volume",__FUNCTION__);
++                struct audio_port_config *config;
++                sp<AudioPortConfig> audioPortConfig;
++                sp<DeviceDescriptor>  deviceDesc;
++                config = &(patchDesc->mPatch.sinks[0]);
++                bool bOrignalDeviceRemoved = false;
++                if (config->role == AUDIO_PORT_ROLE_SINK) {
++                    deviceDesc = mAvailableOutputDevices.getDeviceFromId(config->id);
++                } else {
++                    ALOGV("1st deviceDesc NULL");
++                    break;
++                }
++                if (deviceDesc == NULL) {
++                    bOrignalDeviceRemoved = true; // Headset is removed
++                    ALOGV("bOrignalDeviceRemoved Device %s replace %x", dumpDeviceTypes(deviceTypes).c_str(), config->ext.device.type);
++                    deviceDesc = mAvailableOutputDevices.getDevice(deviceTypesToBitMask(deviceTypes), String8(""), AUDIO_FORMAT_DEFAULT);
++                    if (deviceDesc == NULL) {
++                        ALOGV("2nd deviceDesc NULL");
++                        break;
++                    }
++                }
++                audioPortConfig = deviceDesc;
++                struct audio_port_config newConfig;
++                audioPortConfig->toAudioPortConfig(&newConfig, config);
++                if (bOrignalDeviceRemoved == true)
++                    newConfig.ext.device.type = config->ext.device.type;
++                newConfig.config_mask = AUDIO_PORT_CONFIG_GAIN | newConfig.config_mask;
++                newConfig.gain.mode = static_cast<audio_gain_mode_t>(AUDIO_GAIN_MODE_JOINT | newConfig.gain.mode);
++                newConfig.gain.values[0] = index;   // pass volume index directly
++                if ((!(isSingleDeviceType(deviceTypes, newConfig.ext.device.type)) || bOrignalDeviceRemoved) && index != 0) // For switch and pop between hp and speaker
++                    newConfig.ext.device.type = deviceTypesToBitMask(deviceTypes); // Device change, Don't un-mute, wait next createAudioPatch
++                    ALOGD("%s newConfig.ext.device.type = %d", __FUNCTION__, newConfig.ext.device.type);
++                    mpClientInterface->setAudioPortConfig(&newConfig, delayMs);
++                }
++        }
++    }
++
+     if (outputDesc == mPrimaryOutput && (isVoiceVolSrc || isBtScoVolSrc)) {
+         float voiceVolume;
+         // Force voice volume to max or mute for Bluetooth SCO as other attenuations are managed by the headset
+@@ -7901,4 +7998,169 @@ sp<SwAudioOutputDescriptor> AudioPolicyManager::openOutputWithProfileAndDevice(
+     return desc;
+ }
+ 
++status_t AudioPolicyManager::addAudioPatch(audio_patch_handle_t handle, const sp<AudioPatch>& patch)
++{
++    bool bFMeable = false;
++    sp<SwAudioOutputDescriptor> outputDesc = mPrimaryOutput;
++    ssize_t index = mAudioPatches.indexOfKey(handle);
++
++    if (index >= 0) {
++        ALOGW("addAudioPatch() patch %d already in", handle);
++        return ALREADY_EXISTS;
++    }
++    if (isFMDirectMode(patch)) {
++        if (outputDesc != NULL) {
++            ALOGV("audiopatch Music+");
++            // creat a client for FM direct Mode>>
++            audio_config_base_t clientConfig = {.sample_rate = 48000,
++                .format = AUDIO_FORMAT_PCM,
++                .channel_mask = AUDIO_CHANNEL_OUT_STEREO };
++            mFmPortId = PolicyAudioPort::getNextUniqueId();
++            audio_attributes_t resultAttr = {.usage = AUDIO_USAGE_MEDIA,
++                .content_type = AUDIO_CONTENT_TYPE_MUSIC};
++
++            sp<TrackClientDescriptor> FmClientDesc =
++                    new TrackClientDescriptor(mFmPortId, -1, (audio_session_t) 0, resultAttr, clientConfig,
++                                                  AUDIO_PORT_HANDLE_NONE, AUDIO_STREAM_MUSIC,
++                                                  mEngine->getProductStrategyForAttributes(resultAttr),
++                                                  toVolumeSource(AUDIO_STREAM_MUSIC),
++                                                  (audio_output_flags_t)AUDIO_FLAG_NONE, false,
++                                                  {}, outputDesc->mPolicyMix);
++            if (FmClientDesc == NULL) {
++                ALOGD("FmClientDesc = NULL");
++                return INVALID_OPERATION;
++            }
++            outputDesc->addClient(FmClientDesc);
++            status_t status = outputDesc->start();
++            if (status != NO_ERROR) {
++                return status;
++            }
++            outputDesc->setClientActive(FmClientDesc, true);
++            mFmPortId = FmClientDesc->portId();
++            ALOGV("FmClientDesc->portId() %d active %d volume source %d, stream %d, curActiveCount %d", FmClientDesc->portId(),
++                    FmClientDesc->active(), FmClientDesc->volumeSource(), FmClientDesc->stream(), outputDesc->mProfile->curActiveCount);
++            // creat a client for FM direct Mode>>
++            bFMeable = true;
++            mFMDirectAudioPatchEnable = true;
++            DeviceVector currentDevice = getNewOutputDevices(outputDesc, false /*fromCache*/);
++            audio_devices_t patchDevice = patch->mPatch.sinks[0].ext.device.type;
++            if (patch->mPatch.num_sinks == 2) {
++                patchDevice = static_cast<audio_devices_t>(patchDevice | patch->mPatch.sinks[1].ext.device.type);
++            }
++            // It will auto correct the right routing device. Alarm stop before 80002000->0x0a
++            setOutputDevices(outputDesc, currentDevice, !currentDevice.containsDeviceWithType(patchDevice));
++        }
++    }
++    status_t status = mAudioPatches.addAudioPatch(handle, patch);
++
++    if (bFMeable && status == NO_ERROR) {
++        sp<TrackClientDescriptor> FmClientDesc = outputDesc->getClient(mFmPortId);
++        if (FmClientDesc != NULL) {
++            ALOGV("mFmPortId %d volumeSource %d", mFmPortId, FmClientDesc->volumeSource());
++            // Change to 500 ms from 2 * Latency in order to covers FM dirty signal
++            DeviceVector device = getNewOutputDevices(outputDesc, false /*fromCache*/);
++            auto &curves = getVolumeCurves(FmClientDesc->volumeSource());
++                checkAndSetVolume(curves, FmClientDesc->volumeSource(),
++                curves.getVolumeIndex(device.types()), outputDesc, device.types(), 500, true);
++            applyStreamVolumes(outputDesc, device.types(), 500, true);
++        } else {
++            ALOGW("no FM client, mFmPortId %d", mFmPortId);
++        }
++    }
++    return status;
++
++}
++
++status_t AudioPolicyManager::removeAudioPatch(audio_patch_handle_t handle)
++{
++    ssize_t index = mAudioPatches.indexOfKey(handle);
++    if (index < 0) {
++    ALOGW("removeAudioPatch() patch %d not in", handle);
++        return ALREADY_EXISTS;
++    }
++    sp<SwAudioOutputDescriptor> outputDesc = mPrimaryOutput;
++    const sp<AudioPatch> patch = mAudioPatches.valueAt(index);
++    sp<TrackClientDescriptor> client = outputDesc->getClient(mFmPortId);
++    if (isFMDirectMode(patch)) {
++        if (outputDesc != NULL) {
++            if (client != NULL) {
++                ALOGV("audiopatch Music-");
++                // need to remove client here
++                // decrement usage count of this stream on the output
++                outputDesc->setClientActive(client, false);
++                outputDesc->removeClient(mFmPortId);
++                outputDesc->stop();
++                mFmPortId = 0;
++                mFMDirectAudioPatchEnable = false;
++                ALOGV("%s outputDesc->mProfile->curActiveCount %d", __FUNCTION__, outputDesc->mProfile->curActiveCount);
++                DeviceVector newDevice = getNewOutputDevices(outputDesc, false /*fromCache*/);
++                setOutputDevices(outputDesc, newDevice, false, outputDesc->latency()*2);
++            }
++        }
++    }
++    return mAudioPatches.removeAudioPatch(handle);
++}
++
++bool AudioPolicyManager::isFMDirectMode(const sp<AudioPatch>& patch)
++{
++    if (patch->mPatch.sources[0].type == AUDIO_PORT_TYPE_DEVICE &&
++        patch->mPatch.sinks[0].type == AUDIO_PORT_TYPE_DEVICE &&
++        (patch->mPatch.sources[0].ext.device.type == AUDIO_DEVICE_IN_FM_TUNER)) {
++        return true;
++    } else {
++        return false;
++    }
++}
++
++bool AudioPolicyManager::isFMActive(void)
++{
++    for (ssize_t i = 0; i < (ssize_t)mAudioPatches.size(); i++) {
++        ALOGVV("%s size %zu/ %zu", __FUNCTION__, i, mAudioPatches.size());
++        sp<AudioPatch> patchDesc = mAudioPatches.valueAt(i);
++        if (isFMDirectMode(patchDesc)||
++            (patchDesc->mPatch.sources[0].type == AUDIO_PORT_TYPE_DEVICE
++            &&patchDesc->mPatch.sources[0].ext.device.type == AUDIO_DEVICE_IN_FM_TUNER)) {
++            ALOGV("FM Active");
++            return true;
++        }
++    }
++    return false;
++}
++
++bool AudioPolicyManager::isFMDirectActive(void)
++{
++    for (ssize_t i = 0; i < (ssize_t)mAudioPatches.size(); i++) {
++        sp<AudioPatch> patchDesc = mAudioPatches.valueAt(i);
++        if (isFMDirectMode(patchDesc)) {
++            ALOGV("FM Direct Active");
++            return true;
++        }
++    }
++    return false;
++}
++
++status_t AudioPolicyManager::setPolicyManagerParameters(int key, int value)
++{
++    audio_devices_t curDevice = Volume::getDeviceForVolume(mPrimaryOutput->devices().types());
++    ALOGV("setPolicyManagerCustomParameters key = %d value = %d curDevice = 0x%x", key, value, curDevice);
++    switch(key) {
++        case 3 /* POLICY_SET_FM_PRESTOP */: {
++            for (size_t i = 0; i < mOutputs.size(); i++) {
++                sp<AudioOutputDescriptor> desc = mOutputs.valueAt(i);
++                if (desc->sharesHwModuleWith(mPrimaryOutput) && !desc->isDuplicated()) {
++                    if (value) {
++                        ALOGD("mute for FM app with Handle %d", mOutputs.keyAt(i));
++                        setVolumeSourceMute(toVolumeSource(AUDIO_STREAM_MUSIC), true, desc);
++                    } else {
++                        ALOGD("unmute for FM app with Handle %d", mOutputs.keyAt(i));
++                        setVolumeSourceMute(toVolumeSource(AUDIO_STREAM_MUSIC), false, desc);
++                    }
++                }
++            }
++            break;
++        }
++    }
++    return NO_ERROR;
++}
++
+ } // namespace android
+diff --git a/services/audiopolicy/managerdefault/AudioPolicyManager.h b/services/audiopolicy/managerdefault/AudioPolicyManager.h
+index a69e08871b..d4849178cb 100644
+--- a/services/audiopolicy/managerdefault/AudioPolicyManager.h
++++ b/services/audiopolicy/managerdefault/AudioPolicyManager.h
+@@ -787,14 +787,8 @@ protected:
+ 
+         audio_io_handle_t selectOutputForMusicEffects();
+ 
+-        virtual status_t addAudioPatch(audio_patch_handle_t handle, const sp<AudioPatch>& patch)
+-        {
+-            return mAudioPatches.addAudioPatch(handle, patch);
+-        }
+-        virtual status_t removeAudioPatch(audio_patch_handle_t handle)
+-        {
+-            return mAudioPatches.removeAudioPatch(handle);
+-        }
++        virtual status_t addAudioPatch(audio_patch_handle_t handle, const sp<AudioPatch>& patch);
++        virtual status_t removeAudioPatch(audio_patch_handle_t handle);
+ 
+         bool isPrimaryModule(const sp<HwModule> &module) const
+         {
+@@ -1023,7 +1017,10 @@ private:
+         sp<SourceClientDescriptor> startAudioSourceInternal(
+                 const struct audio_port_config *source, const audio_attributes_t *attributes,
+                 uid_t uid);
+-
++        audio_port_handle_t mFmPortId;
++        bool mFMDirectAudioPatchEnable;
++        bool mSkipFMVolControl;
++        virtual status_t setPolicyManagerParameters(int key, int value);
+         void onNewAudioModulesAvailableInt(DeviceVector *newDevices);
+ 
+         // Add or remove AC3 DTS encodings based on user preferences.
+@@ -1266,6 +1263,10 @@ private:
+ 
+         // Filters only the relevant flags for getProfileForOutput
+         audio_output_flags_t getRelevantFlags (audio_output_flags_t flags, bool directOnly);
++
++        bool isFMDirectMode(const sp<AudioPatch>& patch);
++        bool isFMActive(void);
++        bool isFMDirectActive(void);
+ };
+ 
+ };
+diff --git a/services/audiopolicy/service/AudioPolicyInterfaceImpl.cpp b/services/audiopolicy/service/AudioPolicyInterfaceImpl.cpp
+index b99f56be85..004f82dbac 100644
+--- a/services/audiopolicy/service/AudioPolicyInterfaceImpl.cpp
++++ b/services/audiopolicy/service/AudioPolicyInterfaceImpl.cpp
+@@ -1837,6 +1837,15 @@ Status AudioPolicyService::getMasterMono(bool* _aidl_return)
+     return binderStatusFromStatusT(mAudioPolicyManager->getMasterMono(_aidl_return));
+ }
+ 
++Status AudioPolicyService::setPolicyManagerParameters(int key, int value)
++{
++    if (mAudioPolicyManager == NULL) {
++        return binderStatusFromStatusT(NO_INIT);
++    }
++    Mutex::Autolock _l(mLock);
++    return binderStatusFromStatusT(mAudioPolicyManager->setPolicyManagerParameters(key, value));
++}
++
+ 
+ Status AudioPolicyService::getStreamVolumeDB(
+         AudioStreamType streamAidl, int32_t indexAidl,
+diff --git a/services/audiopolicy/service/AudioPolicyService.cpp b/services/audiopolicy/service/AudioPolicyService.cpp
+index 21fa82e0d2..ebbc3f333a 100644
+--- a/services/audiopolicy/service/AudioPolicyService.cpp
++++ b/services/audiopolicy/service/AudioPolicyService.cpp
+@@ -2583,6 +2583,23 @@ void AudioPolicyService::AudioCommandThread::insertCommand_l(sp<AudioCommand>& c
+         } else if (command2->mCommand != command->mCommand) continue;
+ 
+         switch (command->mCommand) {
++        case SET_AUDIOPORT_CONFIG: {
++            SetAudioPortConfigData *data = (SetAudioPortConfigData *)command->mParam.get();
++            SetAudioPortConfigData *data2 = (SetAudioPortConfigData *)command2->mParam.get();
++            //if (data->mConfig.id != data2->mConfig.id) break; Port Device should be independent to volume controller
++            if (data->mConfig.role != data2->mConfig.role) break;
++            if (data->mConfig.type != data2->mConfig.type) break;
++            if (data->mConfig.config_mask != data2->mConfig.config_mask) break;
++            if (data->mConfig.sample_rate != data2->mConfig.sample_rate) break;
++            if (data->mConfig.format != data2->mConfig.format) break;
++            //if (data->mConfig.ext.device.type != data2->mConfig.ext.device.type) break;
++            ALOGV("Filtering out SET_AUDIOPORT_CONFIG command");
++            removedCommands.add(command2);
++            command->mTime = command2->mTime;
++            // force delayMs to non 0 so that code below does not request to wait for
++            // command status as the command is now delayed
++            delayMs = 1;
++        } break;
+         case SET_PARAMETERS: {
+             ParametersData *data = (ParametersData *)command->mParam.get();
+             ParametersData *data2 = (ParametersData *)command2->mParam.get();
+diff --git a/services/audiopolicy/service/AudioPolicyService.h b/services/audiopolicy/service/AudioPolicyService.h
+index a87d871d7b..04a1fbf1d6 100644
+--- a/services/audiopolicy/service/AudioPolicyService.h
++++ b/services/audiopolicy/service/AudioPolicyService.h
+@@ -364,6 +364,8 @@ public:
+                             audio_session_t sessionId,
+                             bool suspended);
+ 
++    virtual binder::Status setPolicyManagerParameters(int key, int value);
++
+ private:
+                         AudioPolicyService() ANDROID_API;
+     virtual             ~AudioPolicyService();
+-- 
+2.34.8
+
+
+From 2efafaf8bbf9111967463999db531a3f0a47baf6 Mon Sep 17 00:00:00 2001
+From: Erfan Abdi <erfangplus@gmail.com>
+Date: Tue, 17 May 2022 20:29:50 +0430
+Subject: [PATCH 2/4] stagefright: remove HW_TEXTURE usage from
+ SurfaceMediaSource
+
+* Fixes WFD on mediatek devices
+
+Change-Id: I14c6390a6af12e0bb099f24fe2c8b369fa579810
+Signed-off-by: 7Soldier <reg.fm4@gmail.com>
+Signed-off-by: SHADOW <ayush12345.as@gmail.com>
+---
+ media/libstagefright/SurfaceMediaSource.cpp | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/media/libstagefright/SurfaceMediaSource.cpp b/media/libstagefright/SurfaceMediaSource.cpp
+index d7370551e0..a299d04880 100644
+--- a/media/libstagefright/SurfaceMediaSource.cpp
++++ b/media/libstagefright/SurfaceMediaSource.cpp
+@@ -59,8 +59,7 @@ SurfaceMediaSource::SurfaceMediaSource(uint32_t bufferWidth, uint32_t bufferHeig
+ 
+     BufferQueue::createBufferQueue(&mProducer, &mConsumer);
+     mConsumer->setDefaultBufferSize(bufferWidth, bufferHeight);
+-    mConsumer->setConsumerUsageBits(GRALLOC_USAGE_HW_VIDEO_ENCODER |
+-            GRALLOC_USAGE_HW_TEXTURE);
++    mConsumer->setConsumerUsageBits(GRALLOC_USAGE_HW_VIDEO_ENCODER);
+ 
+     sp<ISurfaceComposer> composer(ComposerService::getComposerService());
+ 
+-- 
+2.34.8
+
+
+From 5f98afa9abd17084fcdff0548a56b3592310c29c Mon Sep 17 00:00:00 2001
+From: 7Soldier <reg.fm4@gmail.com>
+Date: Wed, 6 Jul 2022 03:41:34 +0300
+Subject: [PATCH 3/4] [SQUASH] media: Import extractor changes from
+ t-alps-q0.mp1-V9.122.1
+
+These changes improves media extractors work on MediaTek devices
+Reference: https://github.com/mtk-watch/android_frameworks_av/commit/3181400697637f0d9c7619efc13d1400ec9b38f1
+
+Co-authored-by: TTTT555 <albukerko@gmail.com>
+Co-authored-by: Iscle <albertiscle9@gmail.com>
+Signed-off-by: 7Soldier <reg.fm4@gmail.com>
+Signed-off-by: SHADOW <ayush12345.as@gmail.com>
+---
+ include/media/MediaExtractorPluginHelper.h    |  9 ++-
+ media/extractors/ogg/OggExtractor.cpp         |  3 +-
+ .../nuplayer/GenericSource.cpp                | 65 +++++++++++++++++++
+ .../nuplayer/NuPlayerDecoder.cpp              | 22 +++++++
+ .../nuplayer/include/nuplayer/GenericSource.h | 17 +++++
+ .../include/nuplayer/NuPlayerSource.h         |  5 ++
+ services/mediaextractor/mediaextractor.rc     |  2 +-
+ 7 files changed, 120 insertions(+), 3 deletions(-)
+
+diff --git a/include/media/MediaExtractorPluginHelper.h b/include/media/MediaExtractorPluginHelper.h
+index b86f177e00..047832768b 100644
+--- a/include/media/MediaExtractorPluginHelper.h
++++ b/include/media/MediaExtractorPluginHelper.h
+@@ -165,6 +165,7 @@ public:
+     virtual media_status_t read(
+             MediaBufferHelper **buffer, const ReadOptions *options = NULL) = 0;
+     virtual bool supportsNonBlockingRead() { return false; }
++virtual const char * extractorName() { return ""; }
+ protected:
+     friend CMediaTrack *wrap(MediaTrackHelper *track);
+     MediaBufferGroupHelper *mBufferGroup;
+@@ -177,7 +178,13 @@ inline CMediaTrack *wrap(MediaTrackHelper *track) {
+     CMediaTrack *wrapper = (CMediaTrack*) malloc(sizeof(CMediaTrack));
+     wrapper->data = track;
+     wrapper->free = [](void *data) -> void {
+-        delete (MediaTrackHelper*)(data);
++        // delete MtkAVISource in ~MtkAVIExtractor
++        if (strcmp(((MediaTrackHelper*)data)->extractorName(), "MtkAVIExtractor")) {
++            delete (MediaTrackHelper*)(data);
++        } else {
++            //  stop MTKAVISource to release buffer (for mp3 clone buffer)
++            ((MediaTrackHelper*)data)->stop();
++        }
+     };
+     wrapper->start = [](void *data, CMediaBufferGroup *bufferGroup) -> media_status_t {
+         if (((MediaTrackHelper*)data)->mBufferGroup) {
+diff --git a/media/extractors/ogg/OggExtractor.cpp b/media/extractors/ogg/OggExtractor.cpp
+index eb2246d977..8d3dfcf537 100644
+--- a/media/extractors/ogg/OggExtractor.cpp
++++ b/media/extractors/ogg/OggExtractor.cpp
+@@ -968,6 +968,7 @@ void MyOggExtractor::buildTableOfContents() {
+     Page page;
+     ssize_t pageSize;
+     while ((pageSize = readPage(offset, &page)) > 0) {
++        if ((page.mFlags & 1) == 0) {
+         mTableOfContents.push();
+ 
+         TOCEntry &entry =
+@@ -975,7 +976,7 @@ void MyOggExtractor::buildTableOfContents() {
+ 
+         entry.mPageOffset = offset;
+         entry.mTimeUs = getTimeUsOfGranule(page.mGranulePosition);
+-
++        }
+         offset += (size_t)pageSize;
+     }
+ 
+diff --git a/media/libmediaplayerservice/nuplayer/GenericSource.cpp b/media/libmediaplayerservice/nuplayer/GenericSource.cpp
+index 36e4d4af8e..717bcf4ce9 100644
+--- a/media/libmediaplayerservice/nuplayer/GenericSource.cpp
++++ b/media/libmediaplayerservice/nuplayer/GenericSource.cpp
+@@ -20,6 +20,7 @@
+ #include "GenericSource.h"
+ #include "NuPlayerDrm.h"
+ 
++#include <binder/IPCThreadState.h>
+ #include <binder/IServiceManager.h>
+ #include <cutils/properties.h>
+ #include <datasource/PlayerServiceDataSourceFactory.h>
+@@ -84,6 +85,9 @@ NuPlayer::GenericSource::GenericSource(
+     mBufferingSettings.mInitialMarkMs = kInitialMarkMs;
+     mBufferingSettings.mResumePlaybackMarkMs = kResumePlaybackMarkMs;
+     resetDataSource();
++//mtkadd+
++    init();
++//mtkadd-
+ }
+ 
+ void NuPlayer::GenericSource::resetDataSource() {
+@@ -201,6 +205,23 @@ status_t NuPlayer::GenericSource::initFromDataSource() {
+         }
+     }
+ 
++//mtkadd+
++    //for mp3 low power
++    mExtractor = extractor;
++    const char *extractorName = mExtractor->name();
++    if (extractorName != NULL
++            && !strcasecmp(extractorName, "MtkMP3Extractor")) {
++        mIsMtkMp3 = true;
++    } else if (extractorName != NULL
++            && !strcasecmp(extractorName, "CAFExtractor")) {
++        mIsMtkAlac = true;
++    }
++    if (mIsMtkMp3 && mPID < 0xffffffff) {
++        ALOGV("initFromDataSource, set mPID:%d to MtkMP3Extractor!",mPID);
++        sp<MetaData> mp3Meta = extractor->getTrackMetaData(0, mPID);
++    }
++//mtkadd-
++
+     int32_t totalBitrate = 0;
+ 
+     mMimes.clear();
+@@ -342,6 +363,10 @@ bool NuPlayer::GenericSource::isStreaming() const {
+ 
+ NuPlayer::GenericSource::~GenericSource() {
+     ALOGV("~GenericSource");
++    //mtkadd for stop toc thread before source release.
++    if ((mIsMtkMp3 || mIsMtkAlac) && mAudioTrack.mSource != NULL) {
++        mAudioTrack.mSource->stop();
++    }
+     if (mLooper != NULL) {
+         mLooper->unregisterHandler(id());
+         mLooper->stop();
+@@ -1334,6 +1359,13 @@ void NuPlayer::GenericSource::readBuffer(
+         case MEDIA_TRACK_TYPE_AUDIO:
+             track = &mAudioTrack;
+             maxBuffers = 64;
++// mtkadd+
++            // add for TS, resolve 4k video play not smooth, too many buffers will cause parse audio too long time.
++            // it will block video parse, as TS video and audio is interleave.
++            if (isTS()) {
++                maxBuffers = 8;
++            }
++// mtkadd-
+             break;
+         case MEDIA_TRACK_TYPE_SUBTITLE:
+             track = &mSubtitleTrack;
+@@ -1715,4 +1747,37 @@ void NuPlayer::GenericSource::signalBufferReturned(MediaBufferBase *buffer)
+     buffer->release(); // this leads to delete since that there is no observor
+ }
+ 
++//mtkadd+
++
++void NuPlayer::GenericSource::init() {
++    mExtractor = NULL;
++    mIsMtkMp3 = false;
++    mIsMtkAlac = false;
++    mPID = IPCThreadState::self()->getCallingPid();
++}
++
++void NuPlayer::GenericSource::setGetMp3Param(int32_t *flag, bool set) {
++    if (!set) {  //getflag
++        *flag = mIsMtkMp3 ? 1 : 0;
++        return;
++    }
++    //set flag
++    if (mIsMtkMp3 && *flag == 1) {
++        ALOGV("set mp3 codec sucessfully");
++        mExtractor->getTrackMetaData(0/*index*/, 0xffffffff/*flag*/);
++    }
++}
++
++// for TS
++bool NuPlayer::GenericSource::isTS() {
++    const char *mime = NULL;
++    if (mFileMeta != NULL && mFileMeta->findCString(kKeyMIMEType, &mime)
++            && !strcasecmp(mime, MEDIA_MIMETYPE_CONTAINER_MPEG2TS)) {
++        return true;
++    }
++    return false;
++}
++//mtkadd-
++
++
+ }  // namespace android
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayerDecoder.cpp b/media/libmediaplayerservice/nuplayer/NuPlayerDecoder.cpp
+index 52b2041ea8..19eb87351c 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayerDecoder.cpp
++++ b/media/libmediaplayerservice/nuplayer/NuPlayerDecoder.cpp
+@@ -346,6 +346,19 @@ void NuPlayer::Decoder::onConfigure(const sp<AMessage> &format) {
+     ALOGV("onConfigure mCrypto: %p (%d)  mIsSecure: %d",
+             crypto.get(), (crypto != NULL ? crypto->getStrongCount() : 0), mIsSecure);
+ 
++//mtkadd+
++    if (!strcasecmp(mComponentName.c_str(), "OMX.MTK.AUDIO.DECODER.MP3")) {
++        int32_t mtkmp3extractorFlag = 0;
++        //get mtkmp3extractor flag
++        mSource->setGetMp3Param(&mtkmp3extractorFlag, false /*get*/);
++        if (mtkmp3extractorFlag == 1) {
++            format->setInt32("mtk-mp3extractor", 1);
++            format->setInt32("app-pid", (int32_t)mPid);
++            ALOGV("set mp3 lowpwer flag to decoder app-pid:%ld", (long)mPid);
++        }
++    }
++//mtkadd-
++
+     err = mCodec->configure(
+             format, mSurface, crypto, 0 /* flags */);
+ 
+@@ -394,6 +407,15 @@ void NuPlayer::Decoder::onConfigure(const sp<AMessage> &format) {
+ 
+     mPaused = false;
+     mResumePending = false;
++
++//mtkadd+ for mp3 lowpower
++    int32_t mtkMp3Codec = 0;
++    if (!strcasecmp(mComponentName.c_str(), "OMX.MTK.AUDIO.DECODER.MP3")
++            && format->findInt32("mtkMp3Codec", &mtkMp3Codec)) {
++        ALOGV("turn on mp3 codec lowpower mode,mtkMp3Codec:%d.",mtkMp3Codec);
++        mSource->setGetMp3Param(&mtkMp3Codec, true /*set*/); //set mp3 codec sucessfully
++    }
++//mtkadd-
+ }
+ 
+ void NuPlayer::Decoder::onSetParameters(const sp<AMessage> &params) {
+diff --git a/media/libmediaplayerservice/nuplayer/include/nuplayer/GenericSource.h b/media/libmediaplayerservice/nuplayer/include/nuplayer/GenericSource.h
+index 80e06f1dc8..cac47a3ae0 100644
+--- a/media/libmediaplayerservice/nuplayer/include/nuplayer/GenericSource.h
++++ b/media/libmediaplayerservice/nuplayer/include/nuplayer/GenericSource.h
+@@ -39,6 +39,9 @@ class IMediaSource;
+ class MediaBuffer;
+ struct MediaClock;
+ struct NuCachedSource2;
++//mtkadd+
++class IMediaExtractor;
++//mtkadd-
+ 
+ struct NuPlayer::GenericSource : public NuPlayer::Source,
+                                  public MediaBufferObserver // Modular DRM
+@@ -239,6 +242,20 @@ private:
+ 
+     status_t checkDrmInfo();
+ 
++//mtkadd+
++    pid_t mPID;
++    sp<IMediaExtractor> mExtractor;
++    bool mIsMtkMp3;
++    bool mIsMtkAlac;
++    void init();
++public:
++    virtual void setGetMp3Param(int32_t *flag, bool set);
++
++private:
++    // add for TS
++    bool isTS();
++//mtkadd-
++
+     DISALLOW_EVIL_CONSTRUCTORS(GenericSource);
+ };
+ 
+diff --git a/media/libmediaplayerservice/nuplayer/include/nuplayer/NuPlayerSource.h b/media/libmediaplayerservice/nuplayer/include/nuplayer/NuPlayerSource.h
+index bf6b539953..4d51edf1f3 100644
+--- a/media/libmediaplayerservice/nuplayer/include/nuplayer/NuPlayerSource.h
++++ b/media/libmediaplayerservice/nuplayer/include/nuplayer/NuPlayerSource.h
+@@ -159,6 +159,11 @@ protected:
+     // Modular DRM
+     void notifyDrmInfo(const sp<ABuffer> &buffer);
+ 
++public:
++    //mtkadd+
++    virtual void setGetMp3Param(int32_t *  /*flag*/, bool  /*set*/){};
++    //mtkadd-
++
+ private:
+     sp<AMessage> mNotify;
+ 
+diff --git a/services/mediaextractor/mediaextractor.rc b/services/mediaextractor/mediaextractor.rc
+index 4fb50d0a62..3b72a9755a 100644
+--- a/services/mediaextractor/mediaextractor.rc
++++ b/services/mediaextractor/mediaextractor.rc
+@@ -1,6 +1,6 @@
+ service mediaextractor /system/bin/mediaextractor
+     class main
+     user mediaex
+-    group drmrpc mediadrm
++    group drmrpc mediadrm readproc
+     ioprio rt 4
+     task_profiles ProcessCapacityHigh
+-- 
+2.34.8
+
+
+From 95cc9db74219136a4211e81df1fcbb1dd6a4256b Mon Sep 17 00:00:00 2001
+From: 7Soldier <reg.fm4@gmail.com>
+Date: Thu, 7 Jul 2022 15:17:53 +0300
+Subject: [PATCH 4/4] begonia: media: libstagefright: Limit max width/height to
+ display size
+
+Adapt width/height sizes to Redmi Note 8 Pro display (2340x1080),
+and limit that in code.
+
+Reference: https://github.com/mtk-watch/android_frameworks_av/commit/3181400697637f0d9c7619efc13d1400ec9b38f1
+
+Co-authored-by: TTTT555 <albukerko@gmail.com>
+Co-authored-by: Iscle <albertiscle9@gmail.com>
+Signed-off-by: 7Soldier <reg.fm4@gmail.com>
+Signed-off-by: SHADOW <ayush12345.as@gmail.com>
+---
+ .../libstagefright/data/media_codecs_google_video_le.xml  | 6 +++---
+ media/libstagefright/omx/SoftVideoDecoderOMXComponent.cpp | 8 ++++++++
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/media/libstagefright/data/media_codecs_google_video_le.xml b/media/libstagefright/data/media_codecs_google_video_le.xml
+index d7c65706d6..0a7a023a7d 100644
+--- a/media/libstagefright/data/media_codecs_google_video_le.xml
++++ b/media/libstagefright/data/media_codecs_google_video_le.xml
+@@ -35,7 +35,7 @@
+         </MediaCodec>
+         <MediaCodec name="OMX.google.h264.decoder" type="video/avc">
+             <!-- profiles and levels:  ProfileHigh : Level51 -->
+-            <Limit name="size" min="2x2" max="2048x2048" />
++            <Limit name="size" min="2x2" max="2340x1080" />
+             <Limit name="alignment" value="2x2" />
+             <Limit name="block-size" value="16x16" />
+             <Limit name="block-count" range="1-16384" />
+@@ -45,7 +45,7 @@
+         </MediaCodec>
+         <MediaCodec name="OMX.google.hevc.decoder" type="video/hevc">
+             <!-- profiles and levels:  ProfileMain : MainTierLevel51 -->
+-            <Limit name="size" min="2x2" max="2048x2048" />
++            <Limit name="size" min="2x2" max="2340x1080" />
+             <Limit name="alignment" value="2x2" />
+             <Limit name="block-size" value="8x8" />
+             <Limit name="block-count" range="1-65536" />
+@@ -54,7 +54,7 @@
+             <Feature name="adaptive-playback" />
+         </MediaCodec>
+         <MediaCodec name="OMX.google.vp8.decoder" type="video/x-vnd.on2.vp8">
+-            <Limit name="size" min="2x2" max="2048x2048" />
++            <Limit name="size" min="2x2" max="2340x1080" />
+             <Limit name="alignment" value="2x2" />
+             <Limit name="block-size" value="16x16" />
+             <Limit name="block-count" range="1-8192" /> <!-- max 2048x1024 -->
+diff --git a/media/libstagefright/omx/SoftVideoDecoderOMXComponent.cpp b/media/libstagefright/omx/SoftVideoDecoderOMXComponent.cpp
+index e853da9763..59e3684549 100644
+--- a/media/libstagefright/omx/SoftVideoDecoderOMXComponent.cpp
++++ b/media/libstagefright/omx/SoftVideoDecoderOMXComponent.cpp
+@@ -507,6 +507,14 @@ OMX_ERRORTYPE SoftVideoDecoderOMXComponent::internalSetParameter(
+                 ALOGE("b/22885421");
+                 return OMX_ErrorBadParameter;
+             }
++            // 20150126 Marcus Huang: Fix ALPS01919422; limits the max width/height
++            //@Vdec_drv_if_public.c
++            //  DEC_MAX_WIDTH = 2340;
++            //  DEC_MAX_HEIGHT = 1080;
++            if ((newWidth * newHeight) > (2340 * 1080)) {
++                ALOGE("frame size is not supported (%d x %d)", newWidth, newHeight);
++                return OMX_ErrorUnsupportedSetting;
++            }
+             if (newWidth != oldWidth || newHeight != oldHeight) {
+                 bool outputPort = (newParams->nPortIndex == kOutputPortIndex);
+                 if (outputPort) {
+-- 
+2.34.8
+
